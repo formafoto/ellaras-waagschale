@@ -489,6 +489,12 @@ li.flash{animation:flash .9s ease-out}
     if(speech.trail.length) $("diag").hidden = false;
   }
 
+  function hintNoText(){
+    var h = $("d-hint");
+    h.className = "hint warn";
+    h.textContent = "Es kommt noch kein Text an. Prüfe: Einstellungen → Allgemein → Tastatur → Diktierfunktion muss eingeschaltet sein. Sonst tippen und dabei das Mikrofon der Tastatur benutzen.";
+  }
+
   var speech = {
     rec: null,
     active: false,
@@ -496,12 +502,47 @@ li.flash{animation:flash .9s ease-out}
     results: 0,
     trail: [],
     watchdog: null,
-    onFinal: null,
-    onInterim: null,
-    onStop: null,
-    start: function(tag, onFinal, onInterim, onStop){
+    endGuard: null,
+    lastToggle: 0,
+    cbFinal: null,
+    cbInterim: null,
+    cbStop: null,
+
+    /* Prellschutz gegen doppelt ausgelöste Tipper */
+    toggleAllowed: function(){
+      var now = Date.now();
+      if(now - this.lastToggle < 500) return false;
+      this.lastToggle = now;
+      return true;
+    },
+
+    begin: function(tag, onFinal, onInterim, onStop){
       if(!SR) return false;
-      this.stop();
+      if(this.active) this.finish("Wechsel");
+      this.tag = tag;
+      this.results = 0;
+      this.trail = [];
+      this.cbFinal = onFinal;
+      this.cbInterim = onInterim;
+      this.cbStop = onStop;
+      this.active = true;
+      $("diag").hidden = true;
+      $("diag").textContent = "";
+
+      if(!this.launch()){
+        this.active = false;
+        return false;
+      }
+
+      var self = this;
+      this.watchdog = setTimeout(function(){
+        if(self.active && self.results === 0){ diagShow(); hintNoText(); }
+      }, 12000);
+      return true;
+    },
+
+    /* Baut für jede Äußerung eine frische Erkennung - Safari mag Wiederverwendung nicht */
+    launch: function(){
       var self = this;
       var r;
       try{ r = new SR(); }catch(e){ return false; }
@@ -509,12 +550,6 @@ li.flash{animation:flash .9s ease-out}
       r.continuous = false;
       r.interimResults = !IS_IOS;
       r.maxAlternatives = 1;
-      this.rec = r; this.tag = tag; this.active = true;
-      this.results = 0; this.trail = [];
-      this.onFinal = onFinal; this.onInterim = onInterim; this.onStop = onStop;
-
-      $("diag").hidden = true;
-      $("diag").textContent = "";
 
       r.onstart = function(){ diagPush("start"); };
       r.onaudiostart = function(){ diagPush("Mikro an"); };
@@ -530,14 +565,14 @@ li.flash{animation:flash .9s ease-out}
             var clean = t.replace(/\s+/g, " ").trim();
             if(clean){
               self.results++;
-              diagPush("Text: " + clean.slice(0, 24));
-              if(self.onFinal) self.onFinal(clean);
+              diagPush("Text: " + clean.slice(0, 22));
+              if(self.cbFinal) self.cbFinal(clean);
             }
           } else {
             interim += t;
           }
         }
-        if(self.onInterim) self.onInterim(interim.replace(/\s+/g, " ").trim());
+        if(self.cbInterim) self.cbInterim(interim.replace(/\s+/g, " ").trim());
       };
 
       r.onerror = function(ev){
@@ -546,62 +581,66 @@ li.flash{animation:flash .9s ease-out}
           self.active = false;
           showMicError(ev.error);
         }
-        /* "no-speech" und "aborted" sind normal - onend startet dann neu */
+        /* "no-speech", "aborted" und "network" fängt onend mit einem Neustart ab */
       };
 
       r.onend = function(){
         diagPush("Ende");
-        if(!self.active){
-          if(self.results === 0) diagShow();
-          if(self.onStop) self.onStop();
-          return;
-        }
-        /* Einzel-Äußerung ist zu Ende - für den nächsten Satz neu starten */
-        var relaunch = function(tries){
+        if(self.rec !== r) return;   /* gehört zu einer abgelösten Sitzung */
+        self.rec = null;
+        if(self.endGuard){ clearTimeout(self.endGuard); self.endGuard = null; }
+
+        if(!self.active){ self.done(); return; }
+
+        setTimeout(function(){
           if(!self.active) return;
-          try{ r.start(); }
-          catch(e){
-            if(tries > 0){ setTimeout(function(){ relaunch(tries - 1); }, 350); return; }
+          if(!self.launch()){
             self.active = false;
             diagPush("Neustart fehlgeschlagen");
-            diagShow();
-            if(self.onStop) self.onStop();
+            self.done();
           }
-        };
-        setTimeout(function(){ relaunch(3); }, IS_IOS ? 300 : 80);
+        }, IS_IOS ? 350 : 100);
       };
 
+      this.rec = r;
       try{ r.start(); }
-      catch(e){ this.active = false; this.rec = null; return false; }
-
-      /* Wenn nach 12 Sekunden noch nichts angekommen ist, Diagnose zeigen */
-      this.watchdog = setTimeout(function(){
-        if(self.active && self.results === 0){
-          diagShow();
-          var h = $("d-hint");
-          h.className = "hint warn";
-          h.textContent = "Es kommt noch kein Text an. Prüfe: Einstellungen → Allgemein → Tastatur → Diktierfunktion muss eingeschaltet sein. Sonst tippen und dabei das Mikrofon der Tastatur benutzen.";
-        }
-      }, 12000);
-
+      catch(e){
+        diagPush("start abgelehnt");
+        this.rec = null;
+        return false;
+      }
       return true;
     },
-    stop: function(){
-      var wasActive = this.active;
-      var cb = this.onStop;
-      var noResults = this.results === 0;
+
+    /* Sauber beenden: stop() liefert die letzte Äußerung noch aus, abort() würde sie verwerfen */
+    finish: function(reason){
+      if(!this.active) return;
       this.active = false;
+      diagPush("gestoppt: " + reason);
       if(this.watchdog){ clearTimeout(this.watchdog); this.watchdog = null; }
+
+      var self = this;
       if(this.rec){
         try{ this.rec.stop(); }catch(e){}
-        try{ this.rec.abort(); }catch(e){}
+        this.endGuard = setTimeout(function(){
+          diagPush("Ende blieb aus");
+          if(self.rec){ try{ self.rec.abort(); }catch(e){} self.rec = null; }
+          self.done();
+        }, 2000);
+      } else {
+        this.done();
       }
-      this.rec = null; this.tag = null;
-      this.onFinal = null; this.onInterim = null; this.onStop = null;
-      if(wasActive){
-        if(noResults) diagShow();
-        if(cb) cb();
-      }
+    },
+
+    done: function(){
+      if(this.watchdog){ clearTimeout(this.watchdog); this.watchdog = null; }
+      if(this.endGuard){ clearTimeout(this.endGuard); this.endGuard = null; }
+      var cb = this.cbStop;
+      var noResults = this.results === 0;
+      this.tag = null;
+      this.cbFinal = null; this.cbInterim = null; this.cbStop = null;
+      if(noResults) diagShow();
+      if(cb) cb();
     }
   };
 
@@ -711,7 +750,7 @@ li.flash{animation:flash .9s ease-out}
 
   /* ---------------- Detailansicht ---------------- */
   function openDecision(id){
-    speech.stop();
+    speech.finish("Ansicht gewechselt");
     state.currentId = id;
     $("view-list").hidden = true;
     $("view-detail").hidden = false;
@@ -725,7 +764,7 @@ li.flash{animation:flash .9s ease-out}
   }
 
   function closeDecision(){
-    speech.stop();
+    speech.finish("Ansicht gewechselt");
     state.currentId = null;
     $("view-detail").hidden = true;
     $("view-list").hidden = false;
@@ -938,9 +977,10 @@ li.flash{animation:flash .9s ease-out}
   }
 
   function toggleRecord(side){
-    if(speech.active && speech.tag === side){ speech.stop(); return; }
+    if(!speech.toggleAllowed()) return;
+    if(speech.active && speech.tag === side){ speech.finish("Knopf"); return; }
     var other = side === "p" ? "c" : "p";
-    var started = speech.start(
+    var started = speech.begin(
       side,
       function(text){
         addEntry(side, text);
@@ -1015,7 +1055,7 @@ li.flash{animation:flash .9s ease-out}
       if(!b){ $("opt-b").focus(); return; }
     }
 
-    speech.stop();
+    speech.finish("Frage angelegt");
     var it = createDecision(t, state.newMode, a, b);
     $("new-title").value = "";
     $("opt-a").value = "";
@@ -1037,8 +1077,9 @@ li.flash{animation:flash .9s ease-out}
   }
 
   $("new-mic").addEventListener("click", function(){
-    if(speech.active && speech.tag === "title"){ speech.stop(); return; }
-    var started = speech.start(
+    if(!speech.toggleAllowed()) return;
+    if(speech.active && speech.tag === "title"){ speech.finish("Knopf"); return; }
+    var started = speech.begin(
       "title",
       function(text){
         var cur = $("new-title").value.trim();
@@ -1054,8 +1095,13 @@ li.flash{animation:flash .9s ease-out}
 
   $("back").addEventListener("click", closeDecision);
 
+  /* Safari blendet die Seite beim Aufnahmestart kurz aus - erst abbrechen,
+     wenn sie eine Sekunde später immer noch ausgeblendet ist. */
   document.addEventListener("visibilitychange", function(){
-    if(document.hidden) speech.stop();
+    if(!document.hidden) return;
+    setTimeout(function(){
+      if(document.hidden) speech.finish("Seite ausgeblendet");
+    }, 1000);
   });
 
   if(!SR){
