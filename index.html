@@ -297,6 +297,13 @@ li.flash{animation:flash .9s ease-out}
 
 .footnote{color:var(--muted);font-size:13.5px;text-align:center;margin:26px auto 0;max-width:40ch;line-height:1.55}
 
+.diag{
+  margin:20px auto 0;max-width:56ch;font-size:12.5px;line-height:1.55;
+  color:var(--muted);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+  overflow-wrap:anywhere;
+}
+
 .app.nospeech .rec-row,
 .app.nospeech #new-mic,
 .app.nospeech .live-bar{display:none}
@@ -416,6 +423,8 @@ li.flash{animation:flash .9s ease-out}
 
     <p class="footnote">Die Waage z&auml;hlt nur. Wie schwer ein Punkt wirklich wiegt, wei&szlig;t du selbst am besten.</p>
   </section>
+
+  <p class="diag" id="diag" hidden></p>
 </div>
 
 <script>
@@ -464,10 +473,29 @@ li.flash{animation:flash .9s ease-out}
   /* ---------------- Spracherkennung ---------------- */
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+  /* Safari auf iPhone/iPad liefert mit continuous=true zwar den Startton,
+     aber nie ein Ergebnis. Deshalb überall Einzel-Äußerung plus Neustart. */
+  var IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+               (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+  function diagPush(name){
+    speech.trail.push(name);
+    if(speech.trail.length > 14) speech.trail.shift();
+    var el = $("diag");
+    el.textContent = "Diagnose: " + speech.trail.join(" · ");
+  }
+
+  function diagShow(){
+    if(speech.trail.length) $("diag").hidden = false;
+  }
+
   var speech = {
     rec: null,
     active: false,
     tag: null,
+    results: 0,
+    trail: [],
+    watchdog: null,
     onFinal: null,
     onInterim: null,
     onStop: null,
@@ -478,11 +506,21 @@ li.flash{animation:flash .9s ease-out}
       var r;
       try{ r = new SR(); }catch(e){ return false; }
       r.lang = "de-DE";
-      r.continuous = true;
-      r.interimResults = true;
+      r.continuous = false;
+      r.interimResults = !IS_IOS;
       r.maxAlternatives = 1;
       this.rec = r; this.tag = tag; this.active = true;
+      this.results = 0; this.trail = [];
       this.onFinal = onFinal; this.onInterim = onInterim; this.onStop = onStop;
+
+      $("diag").hidden = true;
+      $("diag").textContent = "";
+
+      r.onstart = function(){ diagPush("start"); };
+      r.onaudiostart = function(){ diagPush("Mikro an"); };
+      r.onspeechstart = function(){ diagPush("Stimme erkannt"); };
+      r.onspeechend = function(){ diagPush("Stimme zu Ende"); };
+      r.onnomatch = function(){ diagPush("nicht verstanden"); };
 
       r.onresult = function(ev){
         var interim = "";
@@ -490,7 +528,11 @@ li.flash{animation:flash .9s ease-out}
           var t = ev.results[i][0].transcript;
           if(ev.results[i].isFinal){
             var clean = t.replace(/\s+/g, " ").trim();
-            if(clean && self.onFinal) self.onFinal(clean);
+            if(clean){
+              self.results++;
+              diagPush("Text: " + clean.slice(0, 24));
+              if(self.onFinal) self.onFinal(clean);
+            }
           } else {
             interim += t;
           }
@@ -499,6 +541,7 @@ li.flash{animation:flash .9s ease-out}
       };
 
       r.onerror = function(ev){
+        diagPush("Fehler: " + ev.error);
         if(ev.error === "not-allowed" || ev.error === "service-not-allowed" || ev.error === "audio-capture"){
           self.active = false;
           showMicError(ev.error);
@@ -507,38 +550,58 @@ li.flash{animation:flash .9s ease-out}
       };
 
       r.onend = function(){
-        if(self.active){
+        diagPush("Ende");
+        if(!self.active){
+          if(self.results === 0) diagShow();
+          if(self.onStop) self.onStop();
+          return;
+        }
+        /* Einzel-Äußerung ist zu Ende - für den nächsten Satz neu starten */
+        var relaunch = function(tries){
+          if(!self.active) return;
           try{ r.start(); }
           catch(e){
-            setTimeout(function(){
-              if(!self.active) return;
-              try{ r.start(); }
-              catch(e2){
-                self.active = false;
-                if(self.onStop) self.onStop();
-              }
-            }, 300);
+            if(tries > 0){ setTimeout(function(){ relaunch(tries - 1); }, 350); return; }
+            self.active = false;
+            diagPush("Neustart fehlgeschlagen");
+            diagShow();
+            if(self.onStop) self.onStop();
           }
-        } else if(self.onStop){
-          self.onStop();
-        }
+        };
+        setTimeout(function(){ relaunch(3); }, IS_IOS ? 300 : 80);
       };
 
       try{ r.start(); }
       catch(e){ this.active = false; this.rec = null; return false; }
+
+      /* Wenn nach 12 Sekunden noch nichts angekommen ist, Diagnose zeigen */
+      this.watchdog = setTimeout(function(){
+        if(self.active && self.results === 0){
+          diagShow();
+          var h = $("d-hint");
+          h.className = "hint warn";
+          h.textContent = "Es kommt noch kein Text an. Prüfe: Einstellungen → Allgemein → Tastatur → Diktierfunktion muss eingeschaltet sein. Sonst tippen und dabei das Mikrofon der Tastatur benutzen.";
+        }
+      }, 12000);
+
       return true;
     },
     stop: function(){
       var wasActive = this.active;
       var cb = this.onStop;
+      var noResults = this.results === 0;
       this.active = false;
+      if(this.watchdog){ clearTimeout(this.watchdog); this.watchdog = null; }
       if(this.rec){
         try{ this.rec.stop(); }catch(e){}
         try{ this.rec.abort(); }catch(e){}
       }
       this.rec = null; this.tag = null;
       this.onFinal = null; this.onInterim = null; this.onStop = null;
-      if(wasActive && cb) cb();
+      if(wasActive){
+        if(noResults) diagShow();
+        if(cb) cb();
+      }
     }
   };
 
